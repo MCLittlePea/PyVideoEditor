@@ -1,15 +1,27 @@
 import tkinter as tk
 from tkinter import filedialog, ttk, messagebox, colorchooser
 import cv2
-from PIL import Image, ImageTk
+
+# 强制单线程解码，彻底解决 FFmpeg 多线程断言崩溃问题
+cv2.setNumThreads(1)
+from PIL import Image, ImageTk, ImageDraw, ImageFont
 import numpy as np
-from moviepy.editor import (
-    VideoFileClip, AudioFileClip, CompositeVideoClip,
-    TextClip, concatenate_videoclips, vfx, afx
-)
+from moviepy.editor import VideoFileClip, AudioFileClip, CompositeVideoClip, ImageClip, TextClip, CompositeAudioClip, \
+    vfx, afx
 import os
 import sys
 import threading
+import queue
+import time
+
+# ========== 全局配置 ==========
+PROXY_W = 960
+PROXY_H = 540
+EXPORT_W = 1920
+EXPORT_H = 1080
+MAX_CACHE_FRAMES = 5
+TRACK_HEIGHT = 36
+TIMELINE_PADDING = 80
 
 
 def get_resource_path(relative_path):
@@ -17,869 +29,862 @@ def get_resource_path(relative_path):
         return os.path.join(sys._MEIPASS, relative_path)
     elif hasattr(sys, '_NUITKA_ONEFILE_PARENT'):
         return os.path.join(os.path.dirname(sys.executable), relative_path)
-    return os.path.join(os.path.abspath("."), relative_path)
-
-
-ffmpeg_packed_path = get_resource_path("imageio/ffmpeg/ffmpeg-win64-v4.2.2.exe")
-if os.path.exists(ffmpeg_packed_path):
-    os.environ["IMAGEIO_FFMPEG_EXE"] = ffmpeg_packed_path
-
-
-class PyVideoEditor:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("PyVideoEditor - Python视频编辑器")
-        self.root.geometry("1200x700")
-        self.root.configure(bg="#f0f0f0")
-
-        self.video_path = None
-        self.cap = None
-        self.video_clip = None
-        self.fps = 0
-        self.total_frames = 0
-        self.duration = 0
-        self.current_frame = 0
-        self.is_playing = False
-        self.in_point = 0
-        self.out_point = 0
-
-        self.video_list = []
-
-        self.export_format = "mp4"
-        self.export_quality = "high"
-
-        self.create_ui()
-
-        self.root.bind("<space>", lambda e: self.toggle_play())
-        self.root.bind("<Left>", lambda e: self.seek_backward())
-        self.root.bind("<Right>", lambda e: self.seek_forward())
-        self.root.bind("<i>", lambda e: self.set_in_point())
-        self.root.bind("<o>", lambda e: self.set_out_point())
-
-    def create_ui(self):
-        main_frame = tk.Frame(self.root, bg="#f0f0f0")
-        main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-
-        left_frame = tk.Frame(main_frame, bg="#2b2b2b", width=800)
-        left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
-
-        self.video_label = tk.Label(left_frame, bg="#000000")
-        self.video_label.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-
-        control_frame = tk.Frame(left_frame, bg="#2b2b2b")
-        control_frame.pack(fill=tk.X, padx=5, pady=5)
-
-        self.play_button = tk.Button(control_frame, text="▶ 播放", command=self.toggle_play, width=8)
-        self.play_button.pack(side=tk.LEFT, padx=2)
-
-        self.stop_button = tk.Button(control_frame, text="⏹ 停止", command=self.stop_video, width=8)
-        self.stop_button.pack(side=tk.LEFT, padx=2)
-
-        self.timeline = ttk.Scale(control_frame, from_=0, to=100, orient=tk.HORIZONTAL, command=self.on_timeline_change)
-        self.timeline.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=10)
-
-        self.time_label = tk.Label(control_frame, text="00:00:00 / 00:00:00", bg="#2b2b2b", fg="white")
-        self.time_label.pack(side=tk.LEFT, padx=5)
-
-        self.in_button = tk.Button(control_frame, text="入点 [I]", command=self.set_in_point, width=6)
-        self.in_button.pack(side=tk.LEFT, padx=2)
-
-        self.out_button = tk.Button(control_frame, text="出点 [O]", command=self.set_out_point, width=6)
-        self.out_button.pack(side=tk.LEFT, padx=2)
-
-        right_frame = tk.Frame(main_frame, bg="#ffffff", width=350)
-        right_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 0))
-
-        self.notebook = ttk.Notebook(right_frame)
-        self.notebook.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-
-        import_tab = ttk.Frame(self.notebook)
-        self.notebook.add(import_tab, text="导入")
-
-        tk.Button(import_tab, text="导入视频", command=self.import_video,
-                  width=30, height=2).pack(pady=10, padx=10)
-
-        tk.Label(import_tab, text="视频合并列表:").pack(anchor=tk.W, padx=10, pady=(10, 0))
-
-        list_frame = tk.Frame(import_tab)
-        list_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
-
-        self.merge_listbox = tk.Listbox(list_frame, width=35, height=8)
-        self.merge_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
-        scrollbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.merge_listbox.yview)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        self.merge_listbox.config(yscrollcommand=scrollbar.set)
-
-        tk.Button(import_tab, text="添加到合并列表", command=self.add_to_merge).pack(pady=5)
-        tk.Button(import_tab, text="从列表移除", command=self.remove_from_merge).pack(pady=5)
-        tk.Button(import_tab, text="合并视频", command=self.merge_videos, bg="#4CAF50", fg="white").pack(pady=10)
-
-        edit_tab = ttk.Frame(self.notebook)
-        self.notebook.add(edit_tab, text="编辑")
-
-        cut_frame = ttk.LabelFrame(edit_tab, text="视频剪切")
-        cut_frame.pack(fill=tk.X, padx=10, pady=10)
-
-        tk.Label(cut_frame, text="入点:").grid(row=0, column=0, padx=5, pady=5, sticky=tk.W)
-        self.in_entry = tk.Entry(cut_frame, width=10)
-        self.in_entry.grid(row=0, column=1, padx=5, pady=5)
-        self.in_entry.insert(0, "00:00:00")
-
-        tk.Label(cut_frame, text="出点:").grid(row=1, column=0, padx=5, pady=5, sticky=tk.W)
-        self.out_entry = tk.Entry(cut_frame, width=10)
-        self.out_entry.grid(row=1, column=1, padx=5, pady=5)
-        self.out_entry.insert(0, "00:00:00")
-
-        tk.Button(cut_frame, text="剪切并导出", command=self.cut_video,
-                  bg="#2196F3", fg="white").grid(row=2, column=0, columnspan=2, pady=10)
-
-        transform_frame = ttk.LabelFrame(edit_tab, text="视频变换")
-        transform_frame.pack(fill=tk.X, padx=10, pady=10)
-
-        tk.Button(transform_frame, text="顺时针旋转90°",
-                  command=lambda: self.apply_transform("rotate90")).pack(fill=tk.X, padx=5, pady=2)
-        tk.Button(transform_frame, text="逆时针旋转90°",
-                  command=lambda: self.apply_transform("rotate-90")).pack(fill=tk.X, padx=5, pady=2)
-        tk.Button(transform_frame, text="水平翻转",
-                  command=lambda: self.apply_transform("hflip")).pack(fill=tk.X, padx=5, pady=2)
-        tk.Button(transform_frame, text="垂直翻转",
-                  command=lambda: self.apply_transform("vflip")).pack(fill=tk.X, padx=5, pady=2)
-
-        effect_tab = ttk.Frame(self.notebook)
-        self.notebook.add(effect_tab, text="效果")
-
-        color_frame = ttk.LabelFrame(effect_tab, text="颜色效果")
-        color_frame.pack(fill=tk.X, padx=10, pady=10)
-
-        tk.Button(color_frame, text="黑白效果",
-                  command=lambda: self.apply_effect("blackwhite")).pack(fill=tk.X, padx=5, pady=2)
-
-        tk.Label(color_frame, text="亮度调节:").pack(anchor=tk.W, padx=5, pady=(10, 0))
-        self.brightness_scale = ttk.Scale(color_frame, from_=0.1, to=2.0, value=1.0, orient=tk.HORIZONTAL)
-        self.brightness_scale.pack(fill=tk.X, padx=5, pady=2)
-        tk.Button(color_frame, text="应用亮度",
-                  command=lambda: self.apply_effect("brightness")).pack(fill=tk.X, padx=5, pady=2)
-
-        speed_frame = ttk.LabelFrame(effect_tab, text="播放速度")
-        speed_frame.pack(fill=tk.X, padx=10, pady=10)
-
-        tk.Label(speed_frame, text="速度倍数:").pack(anchor=tk.W, padx=5, pady=(10, 0))
-        self.speed_scale = ttk.Scale(speed_frame, from_=0.25, to=4.0, value=1.0, orient=tk.HORIZONTAL)
-        self.speed_scale.pack(fill=tk.X, padx=5, pady=2)
-        tk.Button(speed_frame, text="应用速度",
-                  command=lambda: self.apply_effect("speed")).pack(fill=tk.X, padx=5, pady=2)
-
-        audio_tab = ttk.Frame(self.notebook)
-        self.notebook.add(audio_tab, text="音频")
-
-        tk.Button(audio_tab, text="提取音频为MP3",
-                  command=self.extract_audio).pack(fill=tk.X, padx=10, pady=10)
-
-        volume_frame = ttk.LabelFrame(audio_tab, text="音量调节")
-        volume_frame.pack(fill=tk.X, padx=10, pady=10)
-
-        tk.Label(volume_frame, text="音量倍数:").pack(anchor=tk.W, padx=5, pady=(10, 0))
-        self.volume_scale = ttk.Scale(volume_frame, from_=0.0, to=2.0, value=1.0, orient=tk.HORIZONTAL)
-        self.volume_scale.pack(fill=tk.X, padx=5, pady=2)
-        tk.Button(volume_frame, text="应用音量",
-                  command=lambda: self.apply_effect("volume")).pack(fill=tk.X, padx=5, pady=2)
-
-        tk.Button(audio_tab, text="替换音频",
-                  command=self.replace_audio).pack(fill=tk.X, padx=10, pady=10)
-
-        text_tab = ttk.Frame(self.notebook)
-        self.notebook.add(text_tab, text="文本")
-
-        tk.Label(text_tab, text="文本内容:").pack(anchor=tk.W, padx=10, pady=(10, 0))
-        self.text_content = tk.Entry(text_tab, width=30)
-        self.text_content.pack(fill=tk.X, padx=10, pady=5)
-        self.text_content.insert(0, "示例文本")
-
-        tk.Label(text_tab, text="字体大小:").pack(anchor=tk.W, padx=10, pady=(10, 0))
-        self.font_size = tk.Scale(text_tab, from_=10, to=100, value=30, orient=tk.HORIZONTAL)
-        self.font_size.pack(fill=tk.X, padx=10, pady=5)
-
-        tk.Label(text_tab, text="显示时长(秒):").pack(anchor=tk.W, padx=10, pady=(10, 0))
-        self.text_duration = tk.Entry(text_tab, width=10)
-        self.text_duration.pack(fill=tk.X, padx=10, pady=5)
-        self.text_duration.insert(0, "5")
-
-        tk.Label(text_tab, text="位置:").pack(anchor=tk.W, padx=10, pady=(10, 0))
-        self.text_position = ttk.Combobox(text_tab, values=["顶部", "中间", "底部", "左上角", "右上角", "左下角", "右下角"])
-        self.text_position.pack(fill=tk.X, padx=10, pady=5)
-        self.text_position.current(2)
-
-        self.text_color = "#FFFFFF"
-        tk.Button(text_tab, text="选择颜色", command=self.choose_text_color).pack(fill=tk.X, padx=10, pady=5)
-
-        tk.Button(text_tab, text="添加文本", command=self.add_text,
-                  bg="#9C27B0", fg="white").pack(fill=tk.X, padx=10, pady=10)
-
-        export_tab = ttk.Frame(self.notebook)
-        self.notebook.add(export_tab, text="导出")
-
-        tk.Label(export_tab, text="导出格式:").pack(anchor=tk.W, padx=10, pady=(10, 0))
-        self.format_combo = ttk.Combobox(export_tab, values=["mp4", "avi", "mov", "gif"])
-        self.format_combo.pack(fill=tk.X, padx=10, pady=5)
-        self.format_combo.current(0)
-
-        tk.Label(export_tab, text="导出质量:").pack(anchor=tk.W, padx=10, pady=(10, 0))
-        self.quality_combo = ttk.Combobox(export_tab, values=["低", "中", "高", "极高"])
-        self.quality_combo.pack(fill=tk.X, padx=10, pady=5)
-        self.quality_combo.current(2)
-
-        tk.Button(export_tab, text="导出视频", command=self.export_video,
-                  bg="#FF5722", fg="white", height=2).pack(fill=tk.X, padx=10, pady=20)
-
-        self.status_bar = tk.Label(self.root, text="就绪", bd=1, relief=tk.SUNKEN, anchor=tk.W)
-        self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
-
-        self.progress_bar = ttk.Progressbar(self.root, orient=tk.HORIZONTAL, length=100, mode='determinate')
-        self.progress_bar.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=(0, 5))
-
-    def import_video(self):
-        file_path = filedialog.askopenfilename(
-            title="选择视频文件",
-            filetypes=[("视频文件", "*.mp4 *.avi *.mov *.mkv *.flv *.wmv"), ("所有文件", "*.*")]
-        )
-
-        if file_path:
-            self.video_path = file_path
-            self.load_video()
-
-    def load_video(self):
-        try:
-            if self.cap is not None:
-                self.cap.release()
-            if self.video_clip is not None:
-                self.video_clip.close()
-
-            self.cap = cv2.VideoCapture(self.video_path)
-            self.fps = self.cap.get(cv2.CAP_PROP_FPS)
-            self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            self.duration = self.total_frames / self.fps
-
-            self.video_clip = VideoFileClip(self.video_path)
-
-            self.timeline.config(to=self.duration)
-            self.current_frame = 0
-            self.in_point = 0
-            self.out_point = self.duration
-
-            self.update_time_display()
-            self.show_frame()
-
-            self.status_bar.config(text=f"已加载: {os.path.basename(self.video_path)} | 时长: {self.format_time(self.duration)} | 分辨率: {self.video_clip.size[0]}x{self.video_clip.size[1]}")
-
-        except Exception as e:
-            messagebox.showerror("错误", f"加载视频失败: {str(e)}")
-
-    def show_frame(self):
-        if self.cap is None:
-            return
-
+    return os.path.abspath(".")
+
+
+ffmpeg_path = get_resource_path("imageio/ffmpeg/ffmpeg-win64-v4.2.2.exe")
+if os.path.exists(ffmpeg_path):
+    os.environ["IMAGEIO_FFMPEG_EXE"] = ffmpeg_path
+
+
+# ========== 基础片段类 ==========
+class BaseClip:
+    def __init__(self, name, duration):
+        self.name = name
+        self.start = 0.0  # 在时间轴上的起始时间
+        self.clip_in = 0.0  # 素材内部入点
+        self.clip_out = duration  # 素材内部出点
+        self.duration = duration  # 素材总时长
+        self.track = 0
+        self.selected = False
+        self.opacity = 1.0
+        self.x = 0
+        self.y = 0
+        self.scale = 1.0
+        self.rotation = 0
+
+    @property
+    def length(self):
+        return self.clip_out - self.clip_in
+
+    def get_frame(self, local_time):
+        return None
+
+
+class VideoClipItem(BaseClip):
+    def __init__(self, path):
+        self.path = path
+        self.cap = cv2.VideoCapture(path)
+        self.fps = self.cap.get(cv2.CAP_PROP_FPS)
+        total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        duration = total_frames / self.fps
+        super().__init__(os.path.basename(path), duration)
+        self.orig_w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self.orig_h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        self.speed = 1.0
+        self.reverse = False
+        self.volume = 1.0
+        self.filter = "无"
+        self.brightness = 1.0
+        self.contrast = 1.0
+        self.saturation = 1.0
+        self._cache_idx = -1
+        self._cache_frame = None
+        self.scale = 0.5
+        self.x = 0
+        self.y = 0
+
+    def get_frame(self, local_time):
+        if local_time < 0 or local_time > self.length:
+            return None
+        src_time = self.clip_in + local_time * self.speed
+        if self.reverse:
+            src_time = self.duration - src_time
+        frame_idx = int(src_time * self.fps)
+        if frame_idx == self._cache_idx and self._cache_frame is not None:
+            return self._cache_frame
+        self.cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, min(int(self.duration * self.fps) - 1, frame_idx)))
         ret, frame = self.cap.read()
-        if ret:
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        if not ret:
+            return None
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        w = int(self.orig_w * self.scale * (PROXY_W / EXPORT_W))
+        h = int(self.orig_h * self.scale * (PROXY_H / EXPORT_H))
+        frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_LINEAR)
 
-            label_width = self.video_label.winfo_width()
-            label_height = self.video_label.winfo_height()
+        # 颜色调节
+        if self.brightness != 1.0 or self.contrast != 1.0:
+            frame = cv2.convertScaleAbs(frame, alpha=self.contrast, beta=(self.brightness - 1) * 128)
+        if self.saturation != 1.0:
+            hsv = cv2.cvtColor(frame, cv2.COLOR_RGB2HSV).astype(np.float32)
+            hsv[:, :, 1] *= self.saturation
+            hsv[:, :, 1] = np.clip(hsv[:, :, 1], 0, 255)
+            frame = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB)
 
-            if label_width > 1 and label_height > 1:
-                h, w = frame.shape[:2]
-                ratio = min(label_width / w, label_height / h)
-                new_w = int(w * ratio)
-                new_h = int(h * ratio)
-                frame = cv2.resize(frame, (new_w, new_h))
+        # 滤镜
+        if self.filter == "黑白":
+            frame = cv2.cvtColor(cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY), cv2.COLOR_GRAY2RGB)
+        elif self.filter == "复古":
+            frame = frame.astype(np.float32)
+            frame[:, :, 0] *= 0.9
+            frame[:, :, 1] *= 0.8
+            frame[:, :, 2] *= 0.65
+            frame = np.clip(frame, 0, 255).astype(np.uint8)
+        elif self.filter == "冷色调":
+            frame = frame.astype(np.float32)
+            frame[:, :, 0] *= 1.15
+            frame[:, :, 2] *= 0.85
+            frame = np.clip(frame, 0, 255).astype(np.uint8)
+        elif self.filter == "暖色调":
+            frame = frame.astype(np.float32)
+            frame[:, :, 0] *= 0.85
+            frame[:, :, 2] *= 1.2
+            frame = np.clip(frame, 0, 255).astype(np.uint8)
 
-            img = Image.fromarray(frame)
-            imgtk = ImageTk.PhotoImage(image=img)
+        if self.opacity < 1.0:
+            frame = (frame * self.opacity).astype(np.uint8)
+        self._cache_idx = frame_idx
+        self._cache_frame = frame
+        return frame
 
-            self.video_label.config(image=imgtk)
-            self.video_label.image = imgtk
+    def get_moviepy_clip(self):
+        clip = VideoFileClip(self.path).subclip(self.clip_in, self.clip_out)
+        if self.reverse:
+            clip = clip.fx(vfx.time_mirror)
+        if self.speed != 1.0:
+            clip = clip.fx(vfx.speedx, self.speed)
+        clip = clip.resize((int(self.orig_w * self.scale), int(self.orig_h * self.scale)))
+        clip = clip.set_position((self.x, self.y))
+        clip = clip.set_opacity(self.opacity)
+        clip = clip.set_start(self.start)
+        if self.volume != 1.0:
+            clip = clip.fx(afx.volumex, self.volume)
 
-            self.timeline.set(self.current_frame / self.fps)
-            self.update_time_display()
+        # 颜色与滤镜
+        def apply_color(frame):
+            if self.brightness != 1.0 or self.contrast != 1.0:
+                frame = cv2.convertScaleAbs(frame, alpha=self.contrast, beta=(self.brightness - 1) * 128)
+            if self.saturation != 1.0:
+                hsv = cv2.cvtColor(frame, cv2.COLOR_RGB2HSV).astype(np.float32)
+                hsv[:, :, 1] *= self.saturation
+                hsv[:, :, 1] = np.clip(hsv[:, :, 1], 0, 255)
+                frame = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB)
+            if self.filter == "黑白":
+                frame = cv2.cvtColor(cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY), cv2.COLOR_GRAY2RGB)
+            elif self.filter == "复古":
+                f = frame.astype(np.float32)
+                f[:, :, 0] *= 0.9;
+                f[:, :, 1] *= 0.8;
+                f[:, :, 2] *= 0.65
+                frame = np.clip(f, 0, 255).astype(np.uint8)
+            elif self.filter == "冷色调":
+                f = frame.astype(np.float32)
+                f[:, :, 0] *= 1.15;
+                f[:, :, 2] *= 0.85
+                frame = np.clip(f, 0, 255).astype(np.uint8)
+            elif self.filter == "暖色调":
+                f = frame.astype(np.float32)
+                f[:, :, 0] *= 0.85;
+                f[:, :, 2] *= 1.2
+                frame = np.clip(f, 0, 255).astype(np.uint8)
+            return frame
+
+        clip = clip.fl_image(apply_color)
+        return clip
+
+    def release(self):
+        if self.cap:
+            self.cap.release()
+
+
+class ImageClipItem(BaseClip):
+    def __init__(self, path, duration=5.0):
+        self.path = path
+        img = Image.open(path).convert("RGB")
+        self.orig_img = np.array(img)
+        super().__init__(os.path.basename(path), duration)
+        self.scale = 0.3
+        self.x = 100
+        self.y = 100
+
+    def get_frame(self, local_time):
+        if local_time < 0 or local_time > self.length:
+            return None
+        h, w = self.orig_img.shape[:2]
+        new_w = int(w * self.scale * (PROXY_W / EXPORT_W))
+        new_h = int(h * self.scale * (PROXY_H / EXPORT_H))
+        img = cv2.resize(self.orig_img, (new_w, new_h))
+        if self.opacity < 1.0:
+            img = (img * self.opacity).astype(np.uint8)
+        return img
+
+    def get_moviepy_clip(self):
+        clip = ImageClip(self.path).set_duration(self.length)
+        clip = clip.resize((int(self.orig_img.shape[1] * self.scale), int(self.orig_img.shape[0] * self.scale)))
+        clip = clip.set_position((self.x, self.y)).set_opacity(self.opacity).set_start(self.start)
+        return clip
+
+
+class TextClipItem(BaseClip):
+    def __init__(self, text="新建文本", duration=5.0):
+        super().__init__("文本", duration)
+        self.text = text
+        self.font_size = 48
+        self.color = "#FFFFFF"
+        self.x = PROXY_W // 2
+        self.y = 100
+        self._cache = None
+
+    def get_frame(self, local_time):
+        if local_time < 0 or local_time > self.length:
+            return None
+        if self._cache is not None:
+            return self._cache
+        img = Image.new("RGBA", (len(self.text) * self.font_size, self.font_size + 20), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        try:
+            font = ImageFont.truetype("C:/Windows/Fonts/simhei.ttf", self.font_size)
+        except:
+            font = ImageFont.load_default()
+        draw.text((0, 0), self.text, fill=self.color, font=font)
+        self._cache = np.array(img.convert("RGB"))
+        return self._cache
+
+    def get_moviepy_clip(self):
+        clip = TextClip(self.text, fontsize=self.font_size, color=self.color, font="simhei")
+        clip = clip.set_duration(self.length).set_position((self.x, self.y)).set_start(self.start)
+        return clip
+
+
+class AudioClipItem(BaseClip):
+    def __init__(self, path):
+        self.path = path
+        clip = AudioFileClip(path)
+        super().__init__(os.path.basename(path), clip.duration)
+        clip.close()
+        self.volume = 1.0
+        self.fade_in = 0.0
+        self.fade_out = 0.0
+
+    def get_moviepy_clip(self):
+        clip = AudioFileClip(self.path).subclip(self.clip_in, self.clip_out)
+        clip = clip.volumex(self.volume).set_start(self.start)
+        if self.fade_in > 0:
+            clip = clip.audio_fadein(self.fade_in)
+        if self.fade_out > 0:
+            clip = clip.audio_fadeout(self.fade_out)
+        return clip
+
+
+# ========== 播放引擎（墙钟时间同步，精准无漂移） ==========
+class PlayerEngine(threading.Thread):
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.clips = []
+        self.audio_clips = []
+        self.playing = False
+        self.stop_flag = threading.Event()
+        self.frame_queue = queue.Queue(maxsize=3)
+        self.current_time = 0.0
+        self.total_duration = 10.0
+        self._play_start_time = 0.0
+        self._pause_time = 0.0
+
+    def update_clips(self, clips, audio_clips):
+        self.clips = clips
+        self.audio_clips = audio_clips
+        all_end = [c.start + c.length for c in clips] + [a.start + a.length for a in audio_clips] + [10.0]
+        self.total_duration = max(all_end)
+
+    def seek(self, time):
+        self.current_time = max(0.0, min(time, self.total_duration))
+        self._pause_time = self.current_time
+        if self.playing:
+            self._play_start_time = time.time() - self.current_time
+        with self.frame_queue.mutex:
+            self.frame_queue.queue.clear()
 
     def toggle_play(self):
-        if self.cap is None:
-            return
-
-        self.is_playing = not self.is_playing
-
-        if self.is_playing:
-            self.play_button.config(text="⏸ 暂停")
-            self.play_video()
+        self.playing = not self.playing
+        if self.playing:
+            self._play_start_time = time.time() - self._pause_time
         else:
-            self.play_button.config(text="▶ 播放")
+            self._pause_time = self.current_time
+        return self.playing
 
-    def play_video(self):
-        if self.is_playing and self.cap is not None:
-            self.current_frame += 1
+    def run(self):
+        while not self.stop_flag.is_set():
+            if not self.playing:
+                time.sleep(0.02)
+                continue
 
-            if self.current_frame >= self.total_frames:
-                self.current_frame = 0
-                self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            # 以系统真实时间为准，保证播放速率1:1
+            elapsed = time.time() - self._play_start_time
+            self.current_time = max(0.0, min(elapsed, self.total_duration))
 
-            self.show_frame()
+            if self.current_time >= self.total_duration:
+                self.playing = False
+                self._pause_time = 0.0
+                continue
 
-            delay = int(1000 / self.fps)
-            self.root.after(delay, self.play_video)
+            # 合成画面
+            canvas = np.zeros((PROXY_H, PROXY_W, 3), dtype=np.uint8)
+            sorted_clips = sorted(self.clips, key=lambda c: c.track)
+            for clip in sorted_clips:
+                local_t = self.current_time - clip.start
+                frame = clip.get_frame(local_t)
+                if frame is None:
+                    continue
+                fh, fw = frame.shape[:2]
+                dx1, dy1 = max(0, clip.x), max(0, clip.y)
+                dx2, dy2 = min(PROXY_W, dx1 + fw), min(PROXY_H, dy1 + fh)
+                sx1, sy1 = dx1 - clip.x, dy1 - clip.y
+                sx2, sy2 = sx1 + (dx2 - dx1), sy1 + (dy2 - dy1)
+                if dx2 > dx1 and dy2 > dy1:
+                    canvas[dy1:dy2, dx1:dx2] = frame[sy1:sy2, sx1:sx2]
 
-    def stop_video(self):
-        self.is_playing = False
-        self.play_button.config(text="▶ 播放")
-        self.current_frame = 0
-        if self.cap is not None:
-            self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-        self.show_frame()
+            try:
+                self.frame_queue.put_nowait((self.current_time, canvas))
+            except queue.Full:
+                pass
 
-    def seek_backward(self):
-        if self.cap is None:
+            time.sleep(0.008)  # 约120次/秒轮询，保证时间精度
+
+    def stop(self):
+        self.stop_flag.set()
+        self.join(timeout=1)
+
+
+# ========== 主应用 ==========
+class VideoEditorApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("专业视频编辑器 - 多轨道非线性剪辑")
+        self.root.geometry("1500x950")
+        self.root.configure(bg="#1a1a1a")
+
+        self.video_clips = []
+        self.audio_clips = []
+        self.selected_clip = None
+        self.selected_audio_clip = None
+        self.timeline_zoom = 40
+        self.playhead_x = 0
+        self.drag_mode = None
+        self.drag_clip = None
+        self.drag_offset = 0
+
+        self.player = PlayerEngine()
+        self.player.start()
+
+        self._build_ui()
+        self._preview_loop()
+        self._timeline_update_loop()
+
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _build_ui(self):
+        # 顶部工具栏
+        toolbar = tk.Frame(self.root, bg="#2b2b2b", height=44)
+        toolbar.pack(fill=tk.X)
+        btns = [
+            ("导入视频", self._import_video),
+            ("导入图片/贴纸", self._import_image),
+            ("导入音频", self._import_audio),
+            ("添加文本", self._add_text),
+            ("分割片段", self._split_clip),
+            ("删除选中", self._delete_clip),
+        ]
+        for text, cmd in btns:
+            tk.Button(toolbar, text=text, command=cmd, bg="#3a3a3a", fg="white",
+                      relief=tk.FLAT, padx=12, pady=6).pack(side=tk.LEFT, padx=3, pady=6)
+        tk.Button(toolbar, text="导出视频", command=self._export, bg="#0078d4", fg="white",
+                  relief=tk.FLAT, padx=16, pady=6).pack(side=tk.RIGHT, padx=10, pady=6)
+
+        # 主分割
+        main_pw = tk.PanedWindow(self.root, orient=tk.VERTICAL, bg="#1a1a1a")
+        main_pw.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+
+        # 预览区 + 属性面板
+        top_frame = tk.Frame(main_pw, bg="#000000")
+        main_pw.add(top_frame, height=580)
+
+        self.prop_frame = tk.Frame(top_frame, bg="#2b2b2b", width=240)
+        self.prop_frame.pack(side=tk.RIGHT, fill=tk.Y)
+        tk.Label(self.prop_frame, text="属性面板", bg="#2b2b2b", fg="white",
+                 font=("微软雅黑", 10, "bold")).pack(pady=8)
+        self.prop_content = tk.Frame(self.prop_frame, bg="#2b2b2b")
+        self.prop_content.pack(fill=tk.X, padx=10)
+        self._update_prop_panel()
+
+        self.preview_canvas = tk.Canvas(top_frame, bg="#000000", highlightthickness=0)
+        self.preview_canvas.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        self.preview_canvas.bind("<ButtonPress-1>", self._preview_press)
+        self.preview_canvas.bind("<B1-Motion>", self._preview_drag)
+        self.preview_canvas.bind("<ButtonRelease-1>", self._preview_release)
+
+        # 播放控制栏
+        ctrl_bar = tk.Frame(top_frame, bg="#2b2b2b", height=36)
+        ctrl_bar.pack(fill=tk.X, side=tk.BOTTOM)
+        self.play_btn = tk.Button(ctrl_bar, text="▶ 播放", command=self._toggle_play,
+                                  bg="#3a3a3a", fg="white", relief=tk.FLAT, width=10)
+        self.play_btn.pack(side=tk.LEFT, padx=10, pady=5)
+        self.time_label = tk.Label(ctrl_bar, text="00:00.0 / 00:00.0", bg="#2b2b2b", fg="white")
+        self.time_label.pack(side=tk.LEFT, padx=10)
+
+        # 时间轴区域
+        timeline_frame = tk.Frame(main_pw, bg="#2b2b2b", height=280)
+        main_pw.add(timeline_frame)
+
+        self.timeline_canvas = tk.Canvas(timeline_frame, bg="#1e1e1e", highlightthickness=0)
+        self.timeline_canvas.pack(fill=tk.BOTH, expand=True)
+        self.timeline_canvas.bind("<ButtonPress-1>", self._timeline_press)
+        self.timeline_canvas.bind("<B1-Motion>", self._timeline_drag)
+        self.timeline_canvas.bind("<ButtonRelease-1>", self._timeline_release)
+        self.timeline_canvas.bind("<MouseWheel>", self._timeline_zoom)
+
+    # ========== 导入功能 ==========
+    def _import_video(self):
+        path = filedialog.askopenfilename(filetypes=[("视频文件", "*.mp4 *.avi *.mov *.mkv *.flv")])
+        if not path:
             return
+        clip = VideoClipItem(path)
+        clip.track = len(self.video_clips)
+        clip.y = 0 if clip.track == 0 else 50
+        self.video_clips.append(clip)
+        self._refresh_player()
+        self._redraw_timeline()
 
-        self.current_frame = max(0, self.current_frame - int(self.fps))
-        self.cap.set(cv2.CAP_PROP_POS_FRAMES, self.current_frame)
-        self.show_frame()
-
-    def seek_forward(self):
-        if self.cap is None:
+    def _import_image(self):
+        path = filedialog.askopenfilename(filetypes=[("图片文件", "*.png *.jpg *.jpeg *.bmp *.webp")])
+        if not path:
             return
+        clip = ImageClipItem(path)
+        clip.track = len(self.video_clips)
+        self.video_clips.append(clip)
+        self._refresh_player()
+        self._redraw_timeline()
 
-        self.current_frame = min(self.total_frames - 1, self.current_frame + int(self.fps))
-        self.cap.set(cv2.CAP_PROP_POS_FRAMES, self.current_frame)
-        self.show_frame()
-
-    def on_timeline_change(self, value):
-        if self.cap is None:
+    def _import_audio(self):
+        path = filedialog.askopenfilename(filetypes=[("音频文件", "*.mp3 *.wav *.m4a *.flac")])
+        if not path:
             return
+        audio = AudioClipItem(path)
+        self.audio_clips.append(audio)
+        self._refresh_player()
+        self._redraw_timeline()
 
+    def _add_text(self):
+        clip = TextClipItem()
+        clip.track = len(self.video_clips)
+        self.video_clips.append(clip)
+        self._refresh_player()
+        self._redraw_timeline()
+
+    # ========== 编辑功能 ==========
+    def _split_clip(self):
+        if not self.selected_clip:
+            messagebox.showinfo("提示", "请先在时间轴选中一个视频/图片/文本片段")
+            return
+        c = self.selected_clip
+        split_local = self.player.current_time - c.start
+        if split_local <= 0 or split_local >= c.length:
+            return
+        new_clip_out = c.clip_in + split_local
+        old_clip_in = new_clip_out
+
+        new_clip = type(c)(c.path if hasattr(c, 'path') else c.text)
+        new_clip.__dict__.update(c.__dict__)
+        new_clip.clip_in = old_clip_in
+        new_clip.clip_out = c.clip_out
+        new_clip.start = self.player.current_time
+        new_clip.selected = False
+
+        c.clip_out = new_clip_out
+        self.video_clips.append(new_clip)
+        self._refresh_player()
+        self._redraw_timeline()
+
+    def _delete_clip(self):
+        if self.selected_clip:
+            if hasattr(self.selected_clip, 'release'):
+                self.selected_clip.release()
+            self.video_clips.remove(self.selected_clip)
+            self.selected_clip = None
+        elif self.selected_audio_clip:
+            self.audio_clips.remove(self.selected_audio_clip)
+            self.selected_audio_clip = None
+        self._refresh_player()
+        self._redraw_timeline()
+        self._update_prop_panel()
+
+    # ========== 播放控制 ==========
+    def _toggle_play(self):
+        playing = self.player.toggle_play()
+        self.play_btn.config(text="⏸ 暂停" if playing else "▶ 播放")
+
+    def _preview_loop(self):
         try:
-            time_pos = float(value)
-            self.current_frame = int(time_pos * self.fps)
-            self.cap.set(cv2.CAP_PROP_POS_FRAMES, self.current_frame)
-            self.show_frame()
-        except:
+            t, frame = self.player.frame_queue.get_nowait()
+            self.playhead_x = t * self.timeline_zoom
+            img = Image.fromarray(frame)
+            self._preview_imgtk = ImageTk.PhotoImage(img)
+            self.preview_canvas.delete("all")
+            self.preview_canvas.create_image(0, 0, anchor=tk.NW, image=self._preview_imgtk)
+
+            if self.selected_clip and hasattr(self.selected_clip, 'get_frame'):
+                c = self.selected_clip
+                x, y = c.x, c.y
+                f = c.get_frame(0)
+                if f is not None:
+                    w, h = f.shape[1], f.shape[0]
+                    self.preview_canvas.create_rectangle(x, y, x + w, y + h, outline="#00ff00", width=2)
+        except queue.Empty:
             pass
+        self.root.after(16, self._preview_loop)
 
-    def set_in_point(self):
-        if self.cap is None:
+    def _timeline_update_loop(self):
+        if self.player.playing:
+            self._redraw_timeline()
+            m, s = divmod(self.player.current_time, 60)
+            mt, st = divmod(self.player.total_duration, 60)
+            self.time_label.config(text=f"{int(m):02d}:{s:04.1f} / {int(mt):02d}:{st:04.1f}")
+        self.root.after(100, self._timeline_update_loop)
+
+    # ========== 预览区交互 ==========
+    def _preview_press(self, event):
+        for clip in reversed(self.video_clips):
+            f = clip.get_frame(0)
+            if f is None:
+                continue
+            w, h = f.shape[1], f.shape[0]
+            if clip.x <= event.x <= clip.x + w and clip.y <= event.y <= clip.y + h:
+                self.selected_clip = clip
+                self.selected_audio_clip = None
+                self.drag_mode = "move"
+                self.drag_offset = (event.x - clip.x, event.y - clip.y)
+                self._update_prop_panel()
+                self._redraw_timeline()
+                return
+        self.selected_clip = None
+        self._update_prop_panel()
+
+    def _preview_drag(self, event):
+        if self.drag_mode != "move" or not self.selected_clip:
+            return
+        self.selected_clip.x = max(0, event.x - self.drag_offset[0])
+        self.selected_clip.y = max(0, event.y - self.drag_offset[1])
+
+    def _preview_release(self, event):
+        self.drag_mode = None
+
+    # ========== 时间轴交互 ==========
+    def _redraw_timeline(self):
+        self.timeline_canvas.delete("all")
+        total_w = int(self.player.total_duration * self.timeline_zoom) + 300
+        video_track_count = max(len(self.video_clips), 1)
+        audio_track_count = max(len(self.audio_clips), 1)
+        total_tracks = video_track_count + audio_track_count + 1
+        total_h = 30 + total_tracks * TRACK_HEIGHT + 20
+        self.timeline_canvas.config(scrollregion=(0, 0, total_w, total_h))
+
+        # 时间刻度
+        step = 1 if self.timeline_zoom > 30 else 5
+        for i in range(0, int(self.player.total_duration) + step, step):
+            x = i * self.timeline_zoom
+            self.timeline_canvas.create_line(x, 0, x, 30, fill="#555")
+            self.timeline_canvas.create_text(x + 3, 12, text=f"{i}s", fill="#999", anchor=tk.W, font=("微软雅黑", 8))
+
+        # 轨道线
+        for i in range(total_tracks):
+            y = 30 + i * TRACK_HEIGHT
+            self.timeline_canvas.create_line(0, y, total_w, y, fill="#333")
+
+        # 视频片段
+        for idx, clip in enumerate(self.video_clips):
+            y = 30 + idx * TRACK_HEIGHT + 3
+            x = clip.start * self.timeline_zoom
+            w = clip.length * self.timeline_zoom
+            color = "#4a9eff" if clip != self.selected_clip else "#00ff88"
+            self.timeline_canvas.create_rectangle(x, y, x + w, y + TRACK_HEIGHT - 6, fill=color, outline="")
+            self.timeline_canvas.create_text(x + 6, y + (TRACK_HEIGHT - 6) // 2, text=clip.name, fill="white",
+                                             anchor=tk.W, font=("微软雅黑", 8))
+            # 左右拖拽手柄 - 修复为标准6位颜色
+            self.timeline_canvas.create_rectangle(x, y, x + 6, y + TRACK_HEIGHT - 6, fill="#aaaaaa", outline="")
+            self.timeline_canvas.create_rectangle(x + w - 6, y, x + w, y + TRACK_HEIGHT - 6, fill="#aaaaaa", outline="")
+
+        # 音频片段
+        audio_base = 30 + video_track_count * TRACK_HEIGHT
+        for idx, clip in enumerate(self.audio_clips):
+            y = audio_base + idx * TRACK_HEIGHT + 3
+            x = clip.start * self.timeline_zoom
+            w = clip.length * self.timeline_zoom
+            color = "#ff6b6b" if clip != self.selected_audio_clip else "#ffaa00"
+            self.timeline_canvas.create_rectangle(x, y, x + w, y + TRACK_HEIGHT - 6, fill=color, outline="")
+            self.timeline_canvas.create_text(x + 6, y + (TRACK_HEIGHT - 6) // 2, text=clip.name, fill="white",
+                                             anchor=tk.W, font=("微软雅黑", 8))
+
+        # 播放头
+        px = self.player.current_time * self.timeline_zoom
+        self.timeline_canvas.create_line(px, 0, px, total_h, fill="#ff3333", width=2)
+        self.timeline_canvas.create_polygon(px - 6, 0, px + 6, 0, px, 10, fill="#ff3333", outline="")
+
+    def _timeline_press(self, event):
+        x = self.timeline_canvas.canvasx(event.x)
+        y = self.timeline_canvas.canvasy(event.y)
+
+        # 检测点击片段
+        video_track_count = len(self.video_clips)
+        for idx, clip in enumerate(self.video_clips):
+            cy = 30 + idx * TRACK_HEIGHT + 3
+            cx = clip.start * self.timeline_zoom
+            cw = clip.length * self.timeline_zoom
+            if cy <= y <= cy + TRACK_HEIGHT - 6:
+                if cx <= x <= cx + 6:
+                    self.drag_mode = "resize_left"
+                    self.drag_clip = clip
+                    self.selected_clip = clip
+                    self.selected_audio_clip = None
+                    self._update_prop_panel()
+                    return
+                elif cx + cw - 6 <= x <= cx + cw:
+                    self.drag_mode = "resize_right"
+                    self.drag_clip = clip
+                    self.selected_clip = clip
+                    self.selected_audio_clip = None
+                    self._update_prop_panel()
+                    return
+                elif cx <= x <= cx + cw:
+                    self.drag_mode = "move_clip"
+                    self.drag_clip = clip
+                    self.drag_offset = x - cx
+                    self.selected_clip = clip
+                    self.selected_audio_clip = None
+                    self._update_prop_panel()
+                    return
+
+        # 音频片段点击
+        audio_base = 30 + video_track_count * TRACK_HEIGHT
+        for idx, clip in enumerate(self.audio_clips):
+            cy = audio_base + idx * TRACK_HEIGHT + 3
+            cx = clip.start * self.timeline_zoom
+            cw = clip.length * self.timeline_zoom
+            if cy <= y <= cy + TRACK_HEIGHT - 6 and cx <= x <= cx + cw:
+                self.drag_mode = "move_audio"
+                self.drag_clip = clip
+                self.drag_offset = x - cx
+                self.selected_audio_clip = clip
+                self.selected_clip = None
+                self._update_prop_panel()
+                return
+
+        # 空白处：跳转播放头
+        self.player.seek(x / self.timeline_zoom)
+        self.selected_clip = None
+        self.selected_audio_clip = None
+        self._update_prop_panel()
+        self._redraw_timeline()
+
+    def _timeline_drag(self, event):
+        x = self.timeline_canvas.canvasx(event.x)
+        if self.drag_mode == "move_clip" and self.drag_clip:
+            new_start = max(0, (x - self.drag_offset) / self.timeline_zoom)
+            self.drag_clip.start = new_start
+            self._refresh_player()
+            self._redraw_timeline()
+        elif self.drag_mode == "resize_left" and self.drag_clip:
+            new_in = max(0, x / self.timeline_zoom - self.drag_clip.start)
+            if new_in < self.drag_clip.length - 0.1:
+                self.drag_clip.clip_in = self.drag_clip.clip_in + new_in
+                self.drag_clip.start = x / self.timeline_zoom
+                self._refresh_player()
+                self._redraw_timeline()
+        elif self.drag_mode == "resize_right" and self.drag_clip:
+            new_end = (x / self.timeline_zoom) - self.drag_clip.start
+            if new_end > 0.1:
+                self.drag_clip.clip_out = self.drag_clip.clip_in + new_end
+                self._refresh_player()
+                self._redraw_timeline()
+        elif self.drag_mode == "move_audio" and self.drag_clip:
+            self.drag_clip.start = max(0, (x - self.drag_offset) / self.timeline_zoom)
+            self._refresh_player()
+            self._redraw_timeline()
+        elif self.drag_mode is None:
+            self.player.seek(x / self.timeline_zoom)
+            self._redraw_timeline()
+
+    def _timeline_release(self, event):
+        self.drag_mode = None
+        self.drag_clip = None
+
+    def _timeline_zoom(self, event):
+        if event.delta > 0:
+            self.timeline_zoom = min(150, self.timeline_zoom + 8)
+        else:
+            self.timeline_zoom = max(10, self.timeline_zoom - 8)
+        self._redraw_timeline()
+
+    # ========== 属性面板 ==========
+    def _update_prop_panel(self):
+        for w in self.prop_content.winfo_children():
+            w.destroy()
+
+        clip = self.selected_clip if self.selected_clip else self.selected_audio_clip
+        if not clip:
+            tk.Label(self.prop_content, text="选中片段后编辑属性", bg="#2b2b2b", fg="#888").pack(pady=30)
             return
 
-        self.in_point = self.current_frame / self.fps
-        self.in_entry.delete(0, tk.END)
-        self.in_entry.insert(0, self.format_time(self.in_point))
-        self.status_bar.config(text=f"入点设置为: {self.format_time(self.in_point)}")
+        # 通用属性
+        tk.Label(self.prop_content, text="起始时间(s)", bg="#2b2b2b", fg="white").pack(anchor=tk.W, pady=(4, 0))
+        start_var = tk.DoubleVar(value=round(clip.start, 2))
+        tk.Entry(self.prop_content, textvariable=start_var).pack(fill=tk.X)
 
-    def set_out_point(self):
-        if self.cap is None:
+        tk.Label(self.prop_content, text="时长(s)", bg="#2b2b2b", fg="white").pack(anchor=tk.W, pady=(4, 0))
+        len_var = tk.DoubleVar(value=round(clip.length, 2))
+        tk.Entry(self.prop_content, textvariable=len_var).pack(fill=tk.X)
+
+        # 视频/图片属性
+        if hasattr(clip, 'x'):
+            tk.Label(self.prop_content, text="位置 X", bg="#2b2b2b", fg="white").pack(anchor=tk.W, pady=(8, 0))
+            x_var = tk.IntVar(value=clip.x)
+            tk.Entry(self.prop_content, textvariable=x_var).pack(fill=tk.X)
+
+            tk.Label(self.prop_content, text="位置 Y", bg="#2b2b2b", fg="white").pack(anchor=tk.W, pady=(4, 0))
+            y_var = tk.IntVar(value=clip.y)
+            tk.Entry(self.prop_content, textvariable=y_var).pack(fill=tk.X)
+
+            tk.Label(self.prop_content, text="缩放比例", bg="#2b2b2b", fg="white").pack(anchor=tk.W, pady=(4, 0))
+            scale_var = tk.DoubleVar(value=clip.scale)
+            tk.Entry(self.prop_content, textvariable=scale_var).pack(fill=tk.X)
+
+            tk.Label(self.prop_content, text="不透明度", bg="#2b2b2b", fg="white").pack(anchor=tk.W, pady=(4, 0))
+            op_var = tk.DoubleVar(value=clip.opacity)
+            ttk.Scale(self.prop_content, from_=0.1, to=1.0, variable=op_var).pack(fill=tk.X)
+
+        # 视频专属
+        if isinstance(clip, VideoClipItem):
+            tk.Label(self.prop_content, text="播放速度", bg="#2b2b2b", fg="white").pack(anchor=tk.W, pady=(8, 0))
+            speed_var = tk.DoubleVar(value=clip.speed)
+            tk.Entry(self.prop_content, textvariable=speed_var).pack(fill=tk.X)
+
+            rev_var = tk.BooleanVar(value=clip.reverse)
+            tk.Checkbutton(self.prop_content, text="倒放", variable=rev_var, bg="#2b2b2b", fg="white").pack(anchor=tk.W,
+                                                                                                            pady=4)
+
+            tk.Label(self.prop_content, text="滤镜", bg="#2b2b2b", fg="white").pack(anchor=tk.W, pady=(4, 0))
+            filter_var = tk.StringVar(value=clip.filter)
+            filter_combo = ttk.Combobox(self.prop_content, textvariable=filter_var,
+                                        values=["无", "黑白", "复古", "冷色调", "暖色调"])
+            filter_combo.pack(fill=tk.X)
+
+            tk.Label(self.prop_content, text="亮度", bg="#2b2b2b", fg="white").pack(anchor=tk.W, pady=(4, 0))
+            bri_var = tk.DoubleVar(value=clip.brightness)
+            ttk.Scale(self.prop_content, from_=0.3, to=2.0, variable=bri_var).pack(fill=tk.X)
+
+            tk.Label(self.prop_content, text="对比度", bg="#2b2b2b", fg="white").pack(anchor=tk.W, pady=(4, 0))
+            con_var = tk.DoubleVar(value=clip.contrast)
+            ttk.Scale(self.prop_content, from_=0.3, to=2.0, variable=con_var).pack(fill=tk.X)
+
+            tk.Label(self.prop_content, text="饱和度", bg="#2b2b2b", fg="white").pack(anchor=tk.W, pady=(4, 0))
+            sat_var = tk.DoubleVar(value=clip.saturation)
+            ttk.Scale(self.prop_content, from_=0.0, to=2.0, variable=sat_var).pack(fill=tk.X)
+
+            tk.Label(self.prop_content, text="音量", bg="#2b2b2b", fg="white").pack(anchor=tk.W, pady=(4, 0))
+            vol_var = tk.DoubleVar(value=clip.volume)
+            ttk.Scale(self.prop_content, from_=0.0, to=2.0, variable=vol_var).pack(fill=tk.X)
+
+        # 文本专属
+        if isinstance(clip, TextClipItem):
+            tk.Label(self.prop_content, text="文本内容", bg="#2b2b2b", fg="white").pack(anchor=tk.W, pady=(8, 0))
+            text_var = tk.StringVar(value=clip.text)
+            tk.Entry(self.prop_content, textvariable=text_var).pack(fill=tk.X)
+
+            tk.Label(self.prop_content, text="字号", bg="#2b2b2b", fg="white").pack(anchor=tk.W, pady=(4, 0))
+            size_var = tk.IntVar(value=clip.font_size)
+            tk.Entry(self.prop_content, textvariable=size_var).pack(fill=tk.X)
+
+            def pick_color():
+                c = colorchooser.askcolor(color=clip.color)[1]
+                if c:
+                    clip.color = c
+                    clip._cache = None
+
+            tk.Button(self.prop_content, text="选择颜色", command=pick_color).pack(fill=tk.X, pady=6)
+
+        # 音频专属
+        if isinstance(clip, AudioClipItem):
+            tk.Label(self.prop_content, text="音量", bg="#2b2b2b", fg="white").pack(anchor=tk.W, pady=(8, 0))
+            vol_var = tk.DoubleVar(value=clip.volume)
+            ttk.Scale(self.prop_content, from_=0.0, to=2.0, variable=vol_var).pack(fill=tk.X)
+
+            tk.Label(self.prop_content, text="淡入(s)", bg="#2b2b2b", fg="white").pack(anchor=tk.W, pady=(4, 0))
+            fi_var = tk.DoubleVar(value=clip.fade_in)
+            tk.Entry(self.prop_content, textvariable=fi_var).pack(fill=tk.X)
+
+            tk.Label(self.prop_content, text="淡出(s)", bg="#2b2b2b", fg="white").pack(anchor=tk.W, pady=(4, 0))
+            fo_var = tk.DoubleVar(value=clip.fade_out)
+            tk.Entry(self.prop_content, textvariable=fo_var).pack(fill=tk.X)
+
+        def apply_all():
+            clip.start = start_var.get()
+            if hasattr(clip, 'x'):
+                clip.x = x_var.get()
+                clip.y = y_var.get()
+                clip.scale = scale_var.get()
+                clip.opacity = op_var.get()
+            if isinstance(clip, VideoClipItem):
+                clip.speed = speed_var.get()
+                clip.reverse = rev_var.get()
+                clip.filter = filter_var.get()
+                clip.brightness = bri_var.get()
+                clip.contrast = con_var.get()
+                clip.saturation = sat_var.get()
+                clip.volume = vol_var.get()
+                clip._cache_frame = None
+            if isinstance(clip, TextClipItem):
+                clip.text = text_var.get()
+                clip.font_size = size_var.get()
+                clip._cache = None
+            if isinstance(clip, AudioClipItem):
+                clip.volume = vol_var.get()
+                clip.fade_in = fi_var.get()
+                clip.fade_out = fo_var.get()
+            self._refresh_player()
+            self._redraw_timeline()
+
+        tk.Button(self.prop_content, text="应用修改", command=apply_all,
+                  bg="#0078d4", fg="white", relief=tk.FLAT).pack(fill=tk.X, pady=12)
+
+    # ========== 导出 ==========
+    def _export(self):
+        if not self.video_clips:
+            messagebox.showwarning("提示", "请至少添加一个视频/图片片段")
             return
+        path = filedialog.asksaveasfilename(defaultextension=".mp4", filetypes=[("MP4视频", "*.mp4")])
+        if not path:
+            return
+        threading.Thread(target=self._export_thread, args=(path,), daemon=True).start()
+        messagebox.showinfo("提示", "开始后台导出，完成后会弹窗提示")
 
-        self.out_point = self.current_frame / self.fps
-        self.out_entry.delete(0, tk.END)
-        self.out_entry.insert(0, self.format_time(self.out_point))
-        self.status_bar.config(text=f"出点设置为: {self.format_time(self.out_point)}")
-
-    def update_time_display(self):
-        current_time = self.current_frame / self.fps
-        self.time_label.config(text=f"{self.format_time(current_time)} / {self.format_time(self.duration)}")
-
-    def format_time(self, seconds):
-        hours = int(seconds // 3600)
-        minutes = int((seconds % 3600) // 60)
-        seconds = int(seconds % 60)
-        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
-
-    def parse_time(self, time_str):
+    def _export_thread(self, path):
         try:
-            parts = list(map(int, time_str.split(':')))
-            if len(parts) == 3:
-                return parts[0] * 3600 + parts[1] * 60 + parts[2]
-            elif len(parts) == 2:
-                return parts[0] * 60 + parts[1]
-            else:
-                return float(time_str)
-        except:
-            return 0
+            video_clips = [c.get_moviepy_clip() for c in self.video_clips]
+            final_video = CompositeVideoClip(video_clips, size=(EXPORT_W, EXPORT_H))
 
-    def add_to_merge(self):
-        if self.video_path:
-            self.video_list.append(self.video_path)
-            self.merge_listbox.insert(tk.END, os.path.basename(self.video_path))
+            if self.audio_clips:
+                audio_clips = [a.get_moviepy_clip() for a in self.audio_clips]
+                final_audio = CompositeAudioClip(audio_clips)
+                final_video = final_video.set_audio(final_audio)
 
-    def remove_from_merge(self):
-        selected = self.merge_listbox.curselection()
-        if selected:
-            index = selected[0]
-            self.merge_listbox.delete(index)
-            del self.video_list[index]
-
-    def merge_videos(self):
-        if len(self.video_list) < 2:
-            messagebox.showwarning("警告", "请至少添加两个视频到合并列表")
-            return
-
-        output_path = filedialog.asksaveasfilename(
-            defaultextension=".mp4",
-            filetypes=[("MP4文件", "*.mp4"), ("所有文件", "*.*")]
-        )
-
-        if not output_path:
-            return
-
-        threading.Thread(target=self._merge_videos_thread, args=(output_path,), daemon=True).start()
-
-    def _merge_videos_thread(self, output_path):
-        try:
-            self.status_bar.config(text="正在合并视频...")
-            self.progress_bar.start()
-
-            clips = []
-            for video_path in self.video_list:
-                clip = VideoFileClip(video_path)
-                clips.append(clip)
-
-            final_clip = concatenate_videoclips(clips)
-
-            bitrate = self.get_bitrate()
-
-            final_clip.write_videofile(
-                output_path,
-                codec="libx264",
-                audio_codec="aac",
-                bitrate=bitrate,
-                verbose=False,
-                logger=None
-            )
-
-            for clip in clips:
-                clip.close()
-            final_clip.close()
-
-            self.progress_bar.stop()
-            self.status_bar.config(text="视频合并完成!")
-            messagebox.showinfo("成功", "视频合并完成!")
-
+            final_video.write_videofile(path, codec="libx264", audio_codec="aac",
+                                        bitrate="8000k", fps=30, logger=None)
+            final_video.close()
+            messagebox.showinfo("导出完成", f"视频已保存到：\n{path}")
         except Exception as e:
-            self.progress_bar.stop()
-            self.status_bar.config(text="合并失败")
-            messagebox.showerror("错误", f"合并视频失败: {str(e)}")
-
-    def cut_video(self):
-        if self.video_clip is None:
-            messagebox.showwarning("警告", "请先导入视频")
-            return
-
-        in_time = self.parse_time(self.in_entry.get())
-        out_time = self.parse_time(self.out_entry.get())
-
-        if in_time >= out_time or out_time > self.duration:
-            messagebox.showerror("错误", "无效的时间范围")
-            return
-
-        output_path = filedialog.asksaveasfilename(
-            defaultextension=".mp4",
-            filetypes=[("MP4文件", "*.mp4"), ("所有文件", "*.*")]
-        )
-
-        if not output_path:
-            return
-
-        threading.Thread(target=self._cut_video_thread, args=(output_path, in_time, out_time), daemon=True).start()
-
-    def _cut_video_thread(self, output_path, in_time, out_time):
-        try:
-            self.status_bar.config(text="正在剪切视频...")
-            self.progress_bar.start()
-
-            cut_clip = self.video_clip.subclip(in_time, out_time)
-
-            bitrate = self.get_bitrate()
-
-            cut_clip.write_videofile(
-                output_path,
-                codec="libx264",
-                audio_codec="aac",
-                bitrate=bitrate,
-                verbose=False,
-                logger=None
-            )
-
-            cut_clip.close()
-
-            self.progress_bar.stop()
-            self.status_bar.config(text="视频剪切完成!")
-            messagebox.showinfo("成功", "视频剪切完成!")
-
-        except Exception as e:
-            self.progress_bar.stop()
-            self.status_bar.config(text="剪切失败")
-            messagebox.showerror("错误", f"剪切视频失败: {str(e)}")
-
-    def apply_transform(self, transform_type):
-        if self.video_clip is None:
-            messagebox.showwarning("警告", "请先导入视频")
-            return
-
-        output_path = filedialog.asksaveasfilename(
-            defaultextension=".mp4",
-            filetypes=[("MP4文件", "*.mp4"), ("所有文件", "*.*")]
-        )
-
-        if not output_path:
-            return
-
-        threading.Thread(target=self._apply_transform_thread, args=(output_path, transform_type), daemon=True).start()
-
-    def _apply_transform_thread(self, output_path, transform_type):
-        try:
-            self.status_bar.config(text=f"正在应用{transform_type}变换...")
-            self.progress_bar.start()
-
-            if transform_type == "rotate90":
-                transformed_clip = self.video_clip.rotate(90)
-            elif transform_type == "rotate-90":
-                transformed_clip = self.video_clip.rotate(-90)
-            elif transform_type == "hflip":
-                transformed_clip = self.video_clip.fx(vfx.mirror_x)
-            elif transform_type == "vflip":
-                transformed_clip = self.video_clip.fx(vfx.mirror_y)
-
-            bitrate = self.get_bitrate()
-
-            transformed_clip.write_videofile(
-                output_path,
-                codec="libx264",
-                audio_codec="aac",
-                bitrate=bitrate,
-                verbose=False,
-                logger=None
-            )
-
-            transformed_clip.close()
-
-            self.progress_bar.stop()
-            self.status_bar.config(text="变换应用完成!")
-            messagebox.showinfo("成功", "视频变换完成!")
-
-        except Exception as e:
-            self.progress_bar.stop()
-            self.status_bar.config(text="变换失败")
-            messagebox.showerror("错误", f"应用变换失败: {str(e)}")
-
-    def apply_effect(self, effect_type):
-        if self.video_clip is None:
-            messagebox.showwarning("警告", "请先导入视频")
-            return
-
-        output_path = filedialog.asksaveasfilename(
-            defaultextension=".mp4",
-            filetypes=[("MP4文件", "*.mp4"), ("所有文件", "*.*")]
-        )
-
-        if not output_path:
-            return
-
-        threading.Thread(target=self._apply_effect_thread, args=(output_path, effect_type), daemon=True).start()
-
-    def _apply_effect_thread(self, output_path, effect_type):
-        try:
-            self.status_bar.config(text=f"正在应用{effect_type}效果...")
-            self.progress_bar.start()
-
-            if effect_type == "blackwhite":
-                effect_clip = self.video_clip.fx(vfx.blackwhite)
-            elif effect_type == "brightness":
-                brightness = self.brightness_scale.get()
-                effect_clip = self.video_clip.fx(vfx.colorx, brightness)
-            elif effect_type == "speed":
-                speed = self.speed_scale.get()
-                effect_clip = self.video_clip.fx(vfx.speedx, speed)
-            elif effect_type == "volume":
-                volume = self.volume_scale.get()
-                effect_clip = self.video_clip.fx(afx.volumex, volume)
-
-            bitrate = self.get_bitrate()
-
-            effect_clip.write_videofile(
-                output_path,
-                codec="libx264",
-                audio_codec="aac",
-                bitrate=bitrate,
-                verbose=False,
-                logger=None
-            )
-
-            effect_clip.close()
-
-            self.progress_bar.stop()
-            self.status_bar.config(text="效果应用完成!")
-            messagebox.showinfo("成功", "视频效果应用完成!")
-
-        except Exception as e:
-            self.progress_bar.stop()
-            self.status_bar.config(text="效果应用失败")
-            messagebox.showerror("错误", f"应用效果失败: {str(e)}")
-
-    def extract_audio(self):
-        if self.video_clip is None:
-            messagebox.showwarning("警告", "请先导入视频")
-            return
-
-        output_path = filedialog.asksaveasfilename(
-            defaultextension=".mp3",
-            filetypes=[("MP3文件", "*.mp3"), ("所有文件", "*.*")]
-        )
-
-        if not output_path:
-            return
-
-        threading.Thread(target=self._extract_audio_thread, args=(output_path,), daemon=True).start()
-
-    def _extract_audio_thread(self, output_path):
-        try:
-            self.status_bar.config(text="正在提取音频...")
-            self.progress_bar.start()
-
-            audio = self.video_clip.audio
-            audio.write_audiofile(
-                output_path,
-                codec="mp3",
-                verbose=False,
-                logger=None
-            )
-
-            audio.close()
-
-            self.progress_bar.stop()
-            self.status_bar.config(text="音频提取完成!")
-            messagebox.showinfo("成功", "音频提取完成!")
-
-        except Exception as e:
-            self.progress_bar.stop()
-            self.status_bar.config(text="音频提取失败")
-            messagebox.showerror("错误", f"提取音频失败: {str(e)}")
-
-    def replace_audio(self):
-        if self.video_clip is None:
-            messagebox.showwarning("警告", "请先导入视频")
-            return
-
-        audio_path = filedialog.askopenfilename(
-            title="选择音频文件",
-            filetypes=[("音频文件", "*.mp3 *.wav *.flac *.m4a"), ("所有文件", "*.*")]
-        )
-
-        if not audio_path:
-            return
-
-        output_path = filedialog.asksaveasfilename(
-            defaultextension=".mp4",
-            filetypes=[("MP4文件", "*.mp4"), ("所有文件", "*.*")]
-        )
-
-        if not output_path:
-            return
-
-        threading.Thread(target=self._replace_audio_thread, args=(output_path, audio_path), daemon=True).start()
-
-    def _replace_audio_thread(self, output_path, audio_path):
-        try:
-            self.status_bar.config(text="正在替换音频...")
-            self.progress_bar.start()
-
-            new_audio = AudioFileClip(audio_path)
-
-            if new_audio.duration > self.video_clip.duration:
-                new_audio = new_audio.subclip(0, self.video_clip.duration)
-
-            final_clip = self.video_clip.set_audio(new_audio)
-
-            bitrate = self.get_bitrate()
-
-            final_clip.write_videofile(
-                output_path,
-                codec="libx264",
-                audio_codec="aac",
-                bitrate=bitrate,
-                verbose=False,
-                logger=None
-            )
-
-            new_audio.close()
-            final_clip.close()
-
-            self.progress_bar.stop()
-            self.status_bar.config(text="音频替换完成!")
-            messagebox.showinfo("成功", "音频替换完成!")
-
-        except Exception as e:
-            self.progress_bar.stop()
-            self.status_bar.config(text="音频替换失败")
-            messagebox.showerror("错误", f"替换音频失败: {str(e)}")
-
-    def choose_text_color(self):
-        color = colorchooser.askcolor(title="选择文本颜色")
-        if color[1]:
-            self.text_color = color[1]
-
-    def add_text(self):
-        if self.video_clip is None:
-            messagebox.showwarning("警告", "请先导入视频")
-            return
-
-        text = self.text_content.get()
-        if not text:
-            messagebox.showwarning("警告", "请输入文本内容")
-            return
-
-        try:
-            duration = float(self.text_duration.get())
-        except:
-            messagebox.showerror("错误", "无效的时长")
-            return
-
-        output_path = filedialog.asksaveasfilename(
-            defaultextension=".mp4",
-            filetypes=[("MP4文件", "*.mp4"), ("所有文件", "*.*")]
-        )
-
-        if not output_path:
-            return
-
-        threading.Thread(target=self._add_text_thread, args=(output_path, text, duration), daemon=True).start()
-
-    def _add_text_thread(self, output_path, text, duration):
-        try:
-            self.status_bar.config(text="正在添加文本...")
-            self.progress_bar.start()
-
-            font_path = "C:/Windows/Fonts/simhei.ttf"
-            if not os.path.exists(font_path):
-                font_path = get_resource_path("fonts/simhei.ttf")
-
-            txt_clip = TextClip(
-                text,
-                fontsize=self.font_size.get(),
-                color=self.text_color,
-                font=font_path
-            )
-
-            position_map = {
-                "顶部": ("center", "top"),
-                "中间": ("center", "center"),
-                "底部": ("center", "bottom"),
-                "左上角": ("left", "top"),
-                "右上角": ("right", "top"),
-                "左下角": ("left", "bottom"),
-                "右下角": ("right", "bottom")
-            }
-
-            pos = position_map.get(self.text_position.get(), ("center", "bottom"))
-            txt_clip = txt_clip.set_position(pos).set_duration(min(duration, self.video_clip.duration))
-
-            final_clip = CompositeVideoClip([self.video_clip, txt_clip])
-
-            bitrate = self.get_bitrate()
-
-            final_clip.write_videofile(
-                output_path,
-                codec="libx264",
-                audio_codec="aac",
-                bitrate=bitrate,
-                verbose=False,
-                logger=None
-            )
-
-            txt_clip.close()
-            final_clip.close()
-
-            self.progress_bar.stop()
-            self.status_bar.config(text="文本添加完成!")
-            messagebox.showinfo("成功", "文本添加完成!")
-
-        except Exception as e:
-            self.progress_bar.stop()
-            self.status_bar.config(text="文本添加失败")
-            messagebox.showerror("错误", f"添加文本失败: {str(e)}")
-
-    def export_video(self):
-        if self.video_clip is None:
-            messagebox.showwarning("警告", "请先导入视频")
-            return
-
-        format_ext = self.format_combo.get()
-        output_path = filedialog.asksaveasfilename(
-            defaultextension=f".{format_ext}",
-            filetypes=[(f"{format_ext.upper()}文件", f"*.{format_ext}"), ("所有文件", "*.*")]
-        )
-
-        if not output_path:
-            return
-
-        threading.Thread(target=self._export_video_thread, args=(output_path, format_ext), daemon=True).start()
-
-    def _export_video_thread(self, output_path, format_ext):
-        try:
-            self.status_bar.config(text="正在导出视频...")
-            self.progress_bar.start()
-
-            bitrate = self.get_bitrate()
-
-            if format_ext == "gif":
-                self.video_clip.write_gif(
-                    output_path,
-                    fps=15,
-                    verbose=False,
-                    logger=None
-                )
-            else:
-                codec_map = {
-                    "mp4": "libx264",
-                    "avi": "mpeg4",
-                    "mov": "libx264"
-                }
-
-                codec = codec_map.get(format_ext, "libx264")
-
-                self.video_clip.write_videofile(
-                    output_path,
-                    codec=codec,
-                    audio_codec="aac",
-                    bitrate=bitrate,
-                    verbose=False,
-                    logger=None
-                )
-
-            self.progress_bar.stop()
-            self.status_bar.config(text="视频导出完成!")
-            messagebox.showinfo("成功", "视频导出完成!")
-
-        except Exception as e:
-            self.progress_bar.stop()
-            self.status_bar.config(text="导出失败")
-            messagebox.showerror("错误", f"导出视频失败: {str(e)}")
-
-    def get_bitrate(self):
-        quality_map = {
-            "低": "1000k",
-            "中": "3000k",
-            "高": "5000k",
-            "极高": "10000k"
-        }
-        return quality_map.get(self.quality_combo.get(), "5000k")
-
-    def on_closing(self):
-        if self.cap is not None:
-            self.cap.release()
-        if self.video_clip is not None:
-            self.video_clip.close()
+            messagebox.showerror("导出失败", str(e))
+
+    # ========== 工具方法 ==========
+    def _refresh_player(self):
+        self.player.update_clips(self.video_clips, self.audio_clips)
+
+    def _on_close(self):
+        self.player.stop()
+        for c in self.video_clips:
+            if hasattr(c, 'release'):
+                c.release()
         self.root.destroy()
 
 
 if __name__ == "__main__":
     root = tk.Tk()
-    app = PyVideoEditor(root)
-    root.protocol("WM_DELETE_WINDOW", app.on_closing)
+    app = VideoEditorApp(root)
     root.mainloop()
